@@ -1,0 +1,54 @@
+services:
+  bitcoin:
+    image: lightninglabs/bitcoin-core:30-alpine
+    command:
+      - -regtest
+      - -server
+      - -rpcuser=tylium
+      - -rpcpassword=tylium
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -fallbackfee=0.00001
+      - -txindex=1
+      - -acceptnonstdtxn=1
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=tylium", "-rpcpassword=tylium", "getblockchaininfo"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  tyld:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command:
+      - --genesis
+      - "1"
+      - --datadir
+      - /data
+      - --rpcaddr
+      - ":19332"
+      - --btcrpc
+      - http://bitcoin:18443
+      - --btcuser
+      - tylium
+      - --btcpass
+      - tylium
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+
+  e2e:
+    build:
+      context: ../..
+      dockerfile: test/e2e/Dockerfile
+    environment:
+      - BTC_RPC=http://bitcoin:18443
+      - TYL_RPC=http://tyld:19332
+      - BTC_USER=tylium
+      - BTC_PASS=tylium
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+      tyld:
+        condition: service_started

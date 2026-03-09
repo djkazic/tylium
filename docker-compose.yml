@@ -1,0 +1,76 @@
+services:
+  bitcoin:
+    image: lightninglabs/bitcoin-core:30-alpine
+    command:
+      - -regtest
+      - -server
+      - -rpcuser=tylium
+      - -rpcpassword=tylium
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -fallbackfee=0.00001
+      - -txindex=1
+      - -acceptnonstdtxn=1
+    ports:
+      - "18443:18443"
+    volumes:
+      - bitcoin-data:/home/bitcoin/.bitcoin
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=tylium", "-rpcpassword=tylium", "getblockchaininfo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  tyld:
+    build: .
+    command:
+      - --genesis
+      - "1"
+      - --datadir
+      - /data
+      - --rpcaddr
+      - ":19332"
+      - --btcrpc
+      - http://bitcoin:18443
+      - --btcuser
+      - tylium
+      - --btcpass
+      - tylium
+    ports:
+      - "19332:19332"
+    volumes:
+      - tyld-data:/data
+      - tylium-keys:/root/.tylium
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+
+  tylminer:
+    build: .
+    entrypoint: ["tylminer"]
+    command:
+      - --btcrpc
+      - http://bitcoin:18443
+      - --btcuser
+      - tylium
+      - --btcpass
+      - tylium
+      - --tylrpc
+      - http://tyld:19332
+      - --wallet
+      - ${MINER_WALLET:-default}
+      - --key
+      - ${MINER_KEY:-0000000000000000000000000000000000000000000000000000000000000001}
+      - --duration
+      - "10"
+      - --regtest
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+      tyld:
+        condition: service_started
+
+volumes:
+  bitcoin-data:
+  tyld-data:
+  tylium-keys:
