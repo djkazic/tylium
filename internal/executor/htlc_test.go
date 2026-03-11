@@ -97,6 +97,15 @@ func TestHTLCLockClaimFlow(t *testing.T) {
 	if status != htlcStatusClaimed {
 		t.Fatalf("expected status claimed (1), got %d", status)
 	}
+
+	// Verify preimage was persisted.
+	storedPW0 := readHTLCSlot(stateDB, htlcSlotBase+0*htlcSlotStride+9)
+	storedPW1 := readHTLCSlot(stateDB, htlcSlotBase+0*htlcSlotStride+10)
+	storedPW2 := readHTLCSlot(stateDB, htlcSlotBase+0*htlcSlotStride+11)
+	storedPW3 := readHTLCSlot(stateDB, htlcSlotBase+0*htlcSlotStride+12)
+	if storedPW0 != pw0 || storedPW1 != pw1 || storedPW2 != pw2 || storedPW3 != pw3 {
+		t.Fatal("persisted preimage does not match revealed preimage")
+	}
 }
 
 func TestHTLCLockRefundFlow(t *testing.T) {
@@ -338,6 +347,298 @@ func TestHTLCQuery(t *testing.T) {
 		t.Fatalf("expected status pending (0), got %d", status)
 	}
 	t.Logf("query: sender=%d recipient=%d amount=%d timelock=%d status=%d", senderID, recipientID, amount, timelock, status)
+}
+
+// TestHTLCGaslessClaimZeroBalance verifies that a recipient with zero balance
+// can claim an HTLC using the gasless claim path.
+func TestHTLCGaslessClaimZeroBalance(t *testing.T) {
+	stateDB := state.NewStateDB(merkle.NewMemStore())
+	exec := New(stateDB)
+
+	aliceKey, alice := testKey(t, 0xA)
+	bobKey, bob := testKey(t, 0xB)
+
+	stateDB.SetBalance(alice, 1_000_000)
+	// Bob has ZERO balance — cannot pay gas.
+
+	secret := [32]byte{0x10, 0x20, 0x30}
+	hashlock := types.Sha256(secret[:])
+
+	bobCallerID := binary.BigEndian.Uint64(bob[12:20])
+	hw0 := binary.BigEndian.Uint64(hashlock[0:8])
+	hw1 := binary.BigEndian.Uint64(hashlock[8:16])
+	hw2 := binary.BigEndian.Uint64(hashlock[16:24])
+	hw3 := binary.BigEndian.Uint64(hashlock[24:32])
+
+	// Alice locks 50000 for Bob.
+	lockData := packCallData(HTLCFnLock, bobCallerID, 100, hw0, hw1, hw2, hw3)
+	lockTx := &types.Transaction{
+		Version: 1, Nonce: 0, From: alice, To: HTLCSystemAddress,
+		Value: 50000, GasPrice: 1, GasLimit: 100_000, Data: lockData,
+	}
+	signTx(t, lockTx, aliceKey)
+	exec.ProcessBlock(1, types.ZeroHash, []*types.Transaction{lockTx})
+
+	// Bob claims with GasPrice=0, GasLimit=0 (gasless path).
+	pw0 := binary.BigEndian.Uint64(secret[0:8])
+	pw1 := binary.BigEndian.Uint64(secret[8:16])
+	pw2 := binary.BigEndian.Uint64(secret[16:24])
+	pw3 := binary.BigEndian.Uint64(secret[24:32])
+
+	claimData := packCallData(HTLCFnClaim, 0, pw0, pw1, pw2, pw3)
+	claimTx := &types.Transaction{
+		Version: 1, Nonce: 0, From: bob, To: HTLCSystemAddress,
+		GasPrice: 0, GasLimit: 0, Data: claimData,
+	}
+	signTx(t, claimTx, bobKey)
+
+	_, receipts, _ := exec.ProcessBlock(2, types.ZeroHash, []*types.Transaction{claimTx})
+	if !receipts[0].Success {
+		t.Fatalf("gasless claim should succeed, got: %s", receipts[0].Err)
+	}
+	if receipts[0].GasUsed != 0 {
+		t.Fatalf("gasless claim should use 0 gas, got %d", receipts[0].GasUsed)
+	}
+
+	// Bob should now have the funds.
+	bobBal := stateDB.GetBalance(bob)
+	if bobBal != 50000 {
+		t.Fatalf("bob should have 50000, got %d", bobBal)
+	}
+
+	// Bob's nonce should be incremented.
+	bobAcct := stateDB.GetAccount(bob)
+	if bobAcct.Nonce != 1 {
+		t.Fatalf("bob nonce should be 1, got %d", bobAcct.Nonce)
+	}
+}
+
+// TestHTLCGaslessClaimRejectsValue verifies that a gasless claim with Value > 0 is rejected.
+func TestHTLCGaslessClaimRejectsValue(t *testing.T) {
+	stateDB := state.NewStateDB(merkle.NewMemStore())
+	exec := New(stateDB)
+
+	aliceKey, alice := testKey(t, 0xA)
+	bobKey, bob := testKey(t, 0xB)
+
+	stateDB.SetBalance(alice, 1_000_000)
+	stateDB.SetBalance(bob, 1_000_000)
+
+	secret := [32]byte{0x50}
+	hashlock := types.Sha256(secret[:])
+
+	bobCallerID := binary.BigEndian.Uint64(bob[12:20])
+	hw0 := binary.BigEndian.Uint64(hashlock[0:8])
+	hw1 := binary.BigEndian.Uint64(hashlock[8:16])
+	hw2 := binary.BigEndian.Uint64(hashlock[16:24])
+	hw3 := binary.BigEndian.Uint64(hashlock[24:32])
+
+	lockData := packCallData(HTLCFnLock, bobCallerID, 100, hw0, hw1, hw2, hw3)
+	lockTx := &types.Transaction{
+		Version: 1, Nonce: 0, From: alice, To: HTLCSystemAddress,
+		Value: 10000, GasPrice: 1, GasLimit: 100_000, Data: lockData,
+	}
+	signTx(t, lockTx, aliceKey)
+	exec.ProcessBlock(1, types.ZeroHash, []*types.Transaction{lockTx})
+
+	// Bob tries gasless claim with Value > 0.
+	pw0 := binary.BigEndian.Uint64(secret[0:8])
+	pw1 := binary.BigEndian.Uint64(secret[8:16])
+	pw2 := binary.BigEndian.Uint64(secret[16:24])
+	pw3 := binary.BigEndian.Uint64(secret[24:32])
+
+	claimData := packCallData(HTLCFnClaim, 0, pw0, pw1, pw2, pw3)
+	claimTx := &types.Transaction{
+		Version: 1, Nonce: 0, From: bob, To: HTLCSystemAddress,
+		Value: 1, GasPrice: 0, GasLimit: 0, Data: claimData,
+	}
+	signTx(t, claimTx, bobKey)
+
+	_, receipts, _ := exec.ProcessBlock(2, types.ZeroHash, []*types.Transaction{claimTx})
+	if receipts[0].Success {
+		t.Fatal("gasless claim with Value > 0 should be rejected")
+	}
+	if receipts[0].Err != "gasless claim must have zero value" {
+		t.Fatalf("unexpected error: %s", receipts[0].Err)
+	}
+}
+
+// TestHTLCGaslessClaimWrongPreimage verifies that a failed gasless claim
+// still increments nonce but doesn't transfer funds.
+func TestHTLCGaslessClaimWrongPreimage(t *testing.T) {
+	stateDB := state.NewStateDB(merkle.NewMemStore())
+	exec := New(stateDB)
+
+	aliceKey, alice := testKey(t, 0xA)
+	bobKey, bob := testKey(t, 0xB)
+
+	stateDB.SetBalance(alice, 1_000_000)
+	// Bob has zero balance.
+
+	secret := [32]byte{0x77}
+	hashlock := types.Sha256(secret[:])
+
+	bobCallerID := binary.BigEndian.Uint64(bob[12:20])
+	hw0 := binary.BigEndian.Uint64(hashlock[0:8])
+	hw1 := binary.BigEndian.Uint64(hashlock[8:16])
+	hw2 := binary.BigEndian.Uint64(hashlock[16:24])
+	hw3 := binary.BigEndian.Uint64(hashlock[24:32])
+
+	lockData := packCallData(HTLCFnLock, bobCallerID, 100, hw0, hw1, hw2, hw3)
+	lockTx := &types.Transaction{
+		Version: 1, Nonce: 0, From: alice, To: HTLCSystemAddress,
+		Value: 10000, GasPrice: 1, GasLimit: 100_000, Data: lockData,
+	}
+	signTx(t, lockTx, aliceKey)
+	exec.ProcessBlock(1, types.ZeroHash, []*types.Transaction{lockTx})
+
+	// Bob tries gasless claim with WRONG preimage.
+	badSecret := [32]byte{0xFF}
+	bw0 := binary.BigEndian.Uint64(badSecret[0:8])
+	bw1 := binary.BigEndian.Uint64(badSecret[8:16])
+	bw2 := binary.BigEndian.Uint64(badSecret[16:24])
+	bw3 := binary.BigEndian.Uint64(badSecret[24:32])
+
+	claimData := packCallData(HTLCFnClaim, 0, bw0, bw1, bw2, bw3)
+	claimTx := &types.Transaction{
+		Version: 1, Nonce: 0, From: bob, To: HTLCSystemAddress,
+		GasPrice: 0, GasLimit: 0, Data: claimData,
+	}
+	signTx(t, claimTx, bobKey)
+
+	_, receipts, _ := exec.ProcessBlock(2, types.ZeroHash, []*types.Transaction{claimTx})
+	if receipts[0].Success {
+		t.Fatal("gasless claim with wrong preimage should fail")
+	}
+	if receipts[0].GasUsed != 0 {
+		t.Fatalf("failed gasless claim should use 0 gas, got %d", receipts[0].GasUsed)
+	}
+
+	// Bob's nonce should still be incremented (replay prevention).
+	bobAcct := stateDB.GetAccount(bob)
+	if bobAcct.Nonce != 1 {
+		t.Fatalf("bob nonce should be 1 after failed gasless claim, got %d", bobAcct.Nonce)
+	}
+
+	// Bob should still have zero balance.
+	if stateDB.GetBalance(bob) != 0 {
+		t.Fatal("bob should still have zero balance after failed claim")
+	}
+
+	// HTLC should still be pending.
+	status := readHTLCSlot(stateDB, htlcSlotBase+0*htlcSlotStride+8)
+	if status != htlcStatusPending {
+		t.Fatalf("HTLC should still be pending, got status %d", status)
+	}
+}
+
+// TestHTLCClaimNonexistent verifies that claiming a non-existent HTLC fails.
+func TestHTLCClaimNonexistent(t *testing.T) {
+	stateDB := state.NewStateDB(merkle.NewMemStore())
+	exec := New(stateDB)
+
+	bobKey, bob := testKey(t, 0xB)
+	stateDB.SetBalance(bob, 1_000_000)
+
+	// Try to claim HTLC 0 when no HTLCs exist.
+	claimData := packCallData(HTLCFnClaim, 0, 1, 2, 3, 4)
+	claimTx := &types.Transaction{
+		Version: 1, Nonce: 0, From: bob, To: HTLCSystemAddress,
+		GasPrice: 1, GasLimit: 100_000, Data: claimData,
+	}
+	signTx(t, claimTx, bobKey)
+
+	_, receipts, _ := exec.ProcessBlock(1, types.ZeroHash, []*types.Transaction{claimTx})
+	if receipts[0].Success {
+		t.Fatal("claim of non-existent HTLC should fail")
+	}
+	if receipts[0].Err != "HTLC 0: does not exist" {
+		t.Fatalf("unexpected error: %s", receipts[0].Err)
+	}
+}
+
+// TestHTLCRefundNonexistent verifies that refunding a non-existent HTLC fails.
+func TestHTLCRefundNonexistent(t *testing.T) {
+	stateDB := state.NewStateDB(merkle.NewMemStore())
+	exec := New(stateDB)
+
+	aliceKey, alice := testKey(t, 0xA)
+	stateDB.SetBalance(alice, 1_000_000)
+
+	refundData := packCallData(HTLCFnRefund, 99)
+	refundTx := &types.Transaction{
+		Version: 1, Nonce: 0, From: alice, To: HTLCSystemAddress,
+		GasPrice: 1, GasLimit: 100_000, Data: refundData,
+	}
+	signTx(t, refundTx, aliceKey)
+
+	_, receipts, _ := exec.ProcessBlock(1, types.ZeroHash, []*types.Transaction{refundTx})
+	if receipts[0].Success {
+		t.Fatal("refund of non-existent HTLC should fail")
+	}
+	if receipts[0].Err != "HTLC 99: does not exist" {
+		t.Fatalf("unexpected error: %s", receipts[0].Err)
+	}
+}
+
+// TestHTLCDoubleClaimFails verifies that claiming an already-claimed HTLC fails.
+func TestHTLCDoubleClaimFails(t *testing.T) {
+	stateDB := state.NewStateDB(merkle.NewMemStore())
+	exec := New(stateDB)
+
+	aliceKey, alice := testKey(t, 0xA)
+	bobKey, bob := testKey(t, 0xB)
+
+	stateDB.SetBalance(alice, 1_000_000)
+
+	secret := [32]byte{0xDD}
+	hashlock := types.Sha256(secret[:])
+
+	bobCallerID := binary.BigEndian.Uint64(bob[12:20])
+	hw0 := binary.BigEndian.Uint64(hashlock[0:8])
+	hw1 := binary.BigEndian.Uint64(hashlock[8:16])
+	hw2 := binary.BigEndian.Uint64(hashlock[16:24])
+	hw3 := binary.BigEndian.Uint64(hashlock[24:32])
+
+	// Lock.
+	lockData := packCallData(HTLCFnLock, bobCallerID, 100, hw0, hw1, hw2, hw3)
+	lockTx := &types.Transaction{
+		Version: 1, Nonce: 0, From: alice, To: HTLCSystemAddress,
+		Value: 10000, GasPrice: 1, GasLimit: 100_000, Data: lockData,
+	}
+	signTx(t, lockTx, aliceKey)
+	exec.ProcessBlock(1, types.ZeroHash, []*types.Transaction{lockTx})
+
+	// First claim (gasless).
+	pw0 := binary.BigEndian.Uint64(secret[0:8])
+	pw1 := binary.BigEndian.Uint64(secret[8:16])
+	pw2 := binary.BigEndian.Uint64(secret[16:24])
+	pw3 := binary.BigEndian.Uint64(secret[24:32])
+
+	claimData := packCallData(HTLCFnClaim, 0, pw0, pw1, pw2, pw3)
+	claimTx := &types.Transaction{
+		Version: 1, Nonce: 0, From: bob, To: HTLCSystemAddress,
+		GasPrice: 0, GasLimit: 0, Data: claimData,
+	}
+	signTx(t, claimTx, bobKey)
+
+	_, receipts, _ := exec.ProcessBlock(2, types.ZeroHash, []*types.Transaction{claimTx})
+	if !receipts[0].Success {
+		t.Fatalf("first claim should succeed: %s", receipts[0].Err)
+	}
+
+	// Second claim (should fail — already claimed).
+	claimTx2 := &types.Transaction{
+		Version: 1, Nonce: 1, From: bob, To: HTLCSystemAddress,
+		GasPrice: 0, GasLimit: 0, Data: claimData,
+	}
+	signTx(t, claimTx2, bobKey)
+
+	_, receipts, _ = exec.ProcessBlock(3, types.ZeroHash, []*types.Transaction{claimTx2})
+	if receipts[0].Success {
+		t.Fatal("double claim should fail")
+	}
+	t.Logf("double claim correctly rejected: %s", receipts[0].Err)
 }
 
 // --- helpers ---

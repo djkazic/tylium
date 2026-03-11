@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/djkazic/tylium/contracts"
 	"github.com/djkazic/tylium/internal/executor"
@@ -22,6 +23,8 @@ import (
 
 var (
 	rpcEndpoint  = envOr("TYL_RPC", "http://127.0.0.1:19332")
+	swapdEndpoint = envOr("TYL_SWAPD", "http://127.0.0.1:19333")
+	swapdAPIKey   = envOr("TYL_SWAPD_KEY", "")
 	btcRPC       = envOr("BTC_RPC", "http://127.0.0.1:18332")
 	btcUser      = envOr("BTC_USER", "tylium")
 	btcPass      = envOr("BTC_PASS", "tylium")
@@ -30,6 +33,7 @@ var (
 
 	keyDir      string
 	contractDir string
+	pendingDir  string
 )
 
 func init() {
@@ -40,6 +44,7 @@ func init() {
 	base := envOr("TYL_DATADIR", filepath.Join(home, ".tylium"))
 	keyDir = filepath.Join(base, "keys")
 	contractDir = filepath.Join(base, "contracts")
+	pendingDir = filepath.Join(base, "pending")
 }
 
 // Known function names → selectors.
@@ -104,6 +109,12 @@ func main() {
 		cmdStatus(args[1:])
 	case "history":
 		cmdHistory(args[1:])
+	// Atomic swaps (high-level)
+	case "swap":
+		cmdSwap(args[1:])
+	// HTLC operations (low-level)
+	case "htlc":
+		cmdHTLC(args[1:])
 	// Raw tx builder (power user)
 	case "tx":
 		cmdTx(args[1:])
@@ -142,6 +153,12 @@ func extractGlobalFlags(args []string) []string {
 		case "--wallet":
 			i++
 			btcWallet = args[i]
+		case "--swapd":
+			i++
+			swapdEndpoint = args[i]
+		case "--swapd-key":
+			i++
+			swapdAPIKey = args[i]
 		default:
 			out = append(out, args[i])
 		}
@@ -166,6 +183,15 @@ Commands:
   account <name|addr>                    Get account info (nonce, balance, etc.)
   storage <addr> <slot>                  Read contract storage slot
   receipts [height]                      Show transaction receipts (default: latest)
+  swap buy --amount <amt>                Buy tyBTC with Lightning (fully automatic)
+  swap buy --resume <htlc_id>            Resume an interrupted buy swap
+  swap sell --htlc <id> --invoice <inv>  Sell tyBTC for Lightning
+  swap list                              List active swaps
+  swap status <id>                       Check swap status
+  htlc lock <to> <timelock> <hash> --value <amt>  Lock tyBTC in an HTLC
+  htlc claim <id> <preimage>             Claim an HTLC by revealing the preimage
+  htlc refund <id>                       Refund an expired HTLC
+  htlc query <id>                        Query HTLC status
   finalized                              Show finalized vs optimistic height
   height                                 Current block height
   tx [raw flags]                         Build a raw transaction (power user)
@@ -180,6 +206,10 @@ Bitcoin connection (or use env: BTC_RPC, BTC_USER, BTC_PASS, BTC_WALLET):
   --btcpass PASS          RPC pass (default: tylium)
   --wallet NAME           Bitcoin wallet name
 
+Swap daemon (or use env: TYL_SWAPD, TYL_SWAPD_KEY):
+  --swapd URL             Swap daemon API (default: http://127.0.0.1:19333)
+  --swapd-key KEY         API key for swap daemon
+
 Global (or use env: TYL_RPC, TYL_DATADIR):
   --rpc URL               Tylium RPC (default: http://127.0.0.1:19332)
   --datadir DIR           Data directory for keys/contracts (default: ~/.tylium)
@@ -192,6 +222,8 @@ Examples:
   tylcli deploy amm 997 --name pool
   tylcli call pool addLiquidity 100000 100000
   tylcli call pool swapAForB 10000
+  tylcli swap buy --amount 50000
+  tylcli swap sell --htlc 3 --invoice lnbc...
   tylcli status <txid>
   tylcli history --limit 10
   tylcli balance alice`)
@@ -647,6 +679,709 @@ func signTx(tx *types.Transaction, key *crypto.PrivateKey) {
 		fatal("signing error: %v", err)
 	}
 	tx.Signature = sig
+}
+
+// ============================================================
+// Swap commands (high-level atomic swap UX)
+// ============================================================
+
+func cmdSwap(args []string) {
+	if len(args) < 1 {
+		fatal("usage: tylcli swap <buy|sell|list|status> [args...]")
+	}
+	switch args[0] {
+	case "buy":
+		cmdSwapBuy(args[1:])
+	case "sell":
+		cmdSwapSell(args[1:])
+	case "list":
+		cmdSwapList()
+	case "status":
+		cmdSwapStatus(args[1:])
+	default:
+		fatal("unknown swap subcommand: %s\n\nSubcommands: buy, sell, list, status", args[0])
+	}
+}
+
+// swap buy --amount <amt> [--from <key>]
+// End-to-end buy flow:
+//  1. Generate preimage + hash, save state to disk
+//  2. Call swap daemon → daemon locks HTLC + creates LN invoice
+//  3. Print invoice for user to pay
+//  4. Poll until HTLC appears on-chain
+//  5. Auto-claim the HTLC
+//
+// Restart-safe: if interrupted, re-run with --resume <htlc_id> to continue.
+func cmdSwapBuy(args []string) {
+	_, flags := parseFlags(args)
+
+	// Resume an interrupted buy?
+	if resumeStr, ok := flags["resume"]; ok && resumeStr != "" {
+		cmdSwapBuyResume(mustParseUint(resumeStr, "resume"), flags)
+		return
+	}
+
+	amountStr, ok := flags["amount"]
+	if !ok || amountStr == "" {
+		fatal("usage: tylcli swap buy --amount <tyBTC amount>\n       tylcli swap buy --resume <htlc_id>")
+	}
+	amount := mustParseUint(amountStr, "amount")
+
+	// Resolve the user's signing key and address.
+	key := resolveSigningKey(flags["from"])
+	addr := key.Public().Address()
+
+	// Generate preimage and hash.
+	preimage, err := crypto.GeneratePreimage()
+	if err != nil {
+		fatal("generate preimage: %v", err)
+	}
+	hash := types.Sha256(preimage[:])
+
+	// Call the swap daemon.
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"hash":          hex.EncodeToString(hash[:]),
+		"recipientAddr": addr.Hex(),
+		"amountTyBTC":   amount,
+	})
+
+	resp := swapdPost("/swap/buy", reqBody)
+	var buyResp struct {
+		SwapID  string `json:"swapID"`
+		Invoice string `json:"invoice"`
+		HTLCID  uint64 `json:"htlcID"`
+	}
+	if err := json.Unmarshal(resp, &buyResp); err != nil {
+		fatal("parse swap response: %v", err)
+	}
+
+	// Persist preimage to disk BEFORE printing invoice — crash-safe.
+	saveSwapBuyState(buyResp.HTLCID, preimage, buyResp.Invoice)
+
+	fmt.Printf("swap %s: HTLC %d, %d tyBTC\n\n", buyResp.SwapID, buyResp.HTLCID, amount)
+	fmt.Println("Pay this Lightning invoice:")
+	fmt.Println(buyResp.Invoice)
+	fmt.Println()
+
+	// If interrupted, the user can resume with: tylcli swap buy --resume <htlc_id>
+	swapBuyWaitAndClaim(buyResp.HTLCID, preimage, key)
+}
+
+// cmdSwapBuyResume picks up a buy swap that was interrupted.
+func cmdSwapBuyResume(htlcID uint64, flags map[string]string) {
+	state := loadSwapBuyState(htlcID)
+	if state == nil {
+		fatal("no saved state for HTLC %d\n  Only HTLCs created via 'tylcli swap buy' can be resumed.", htlcID)
+	}
+
+	key := resolveSigningKey(flags["from"])
+	fmt.Printf("Resuming buy swap for HTLC %d\n", htlcID)
+
+	// Check if already claimed.
+	base := uint64(10000) + htlcID*14
+	sysAddr := executor.HTLCSystemAddress.Hex()
+	status := readStorageUint64Safe(sysAddr, base+8)
+	if status == 1 {
+		fmt.Println("HTLC already claimed!")
+		return
+	}
+	if status == 2 {
+		fmt.Println("HTLC was refunded.")
+		return
+	}
+
+	swapBuyWaitAndClaim(htlcID, state.Preimage, key)
+}
+
+func swapBuyWaitAndClaim(htlcID uint64, preimage [32]byte, key *crypto.PrivateKey) {
+	addr := key.Public().Address()
+	base := uint64(10000) + htlcID*14
+	sysAddr := executor.HTLCSystemAddress.Hex()
+
+	fmt.Println("Waiting for HTLC to appear on-chain...")
+
+	for {
+		htlcAmount := readStorageUint64Safe(sysAddr, base+2)
+		if htlcAmount > 0 {
+			break
+		}
+		time.Sleep(3 * time.Second)
+		fmt.Print(".")
+	}
+	fmt.Println()
+
+	// Check it's still pending (not refunded while we waited).
+	status := readStorageUint64Safe(sysAddr, base+8)
+	if status != 0 {
+		if status == 1 {
+			fmt.Println("HTLC already claimed!")
+		} else {
+			fmt.Println("HTLC was refunded.")
+		}
+		return
+	}
+
+	// Verify hashlock matches our preimage before claiming (guards against HTLC ID shift).
+	expectedHash := types.Sha256(preimage[:])
+	hw0 := readStorageUint64Safe(sysAddr, base+3)
+	hw1 := readStorageUint64Safe(sysAddr, base+4)
+	hw2 := readStorageUint64Safe(sysAddr, base+5)
+	hw3 := readStorageUint64Safe(sysAddr, base+6)
+	var onChainHash [32]byte
+	beWriteUint64(onChainHash[0:8], hw0)
+	beWriteUint64(onChainHash[8:16], hw1)
+	beWriteUint64(onChainHash[16:24], hw2)
+	beWriteUint64(onChainHash[24:32], hw3)
+	if types.Hash256(expectedHash) != types.Hash256(onChainHash) {
+		fatal("HTLC %d hashlock mismatch — the HTLC ID may have shifted.\n  Expected: %s\n  On-chain: %s\n  Use 'tylcli htlc query' to find the correct HTLC.", htlcID,
+			hex.EncodeToString(expectedHash[:]), hex.EncodeToString(onChainHash[:]))
+	}
+
+	fmt.Println("HTLC locked on-chain. Claiming...")
+
+	// Prevent duplicate claim submissions.
+	checkHTLCPending(htlcID, "claim")
+
+	// Build and submit the claim transaction.
+	preimageBytes := preimage[:]
+	pw0 := beUint64(preimageBytes[0:8])
+	pw1 := beUint64(preimageBytes[8:16])
+	pw2 := beUint64(preimageBytes[16:24])
+	pw3 := beUint64(preimageBytes[24:32])
+
+	data := contracts.PackCallData(executor.HTLCFnClaim, htlcID, pw0, pw1, pw2, pw3)
+
+	nonce := fetchNonce(addr)
+	tx := &types.Transaction{
+		Version: 1, Nonce: nonce, From: addr,
+		To: executor.HTLCSystemAddress,
+		GasPrice: 0, GasLimit: 0, Data: data,
+	}
+	signTx(tx, key)
+
+	envelope := encoding.EncodeEnvelope(encoding.EnvelopeTypeTx, encoding.EncodeTx(tx))
+	txid := tx.TxID().Hex()
+
+	pushAndReport(envelope, 0, txid)
+	markHTLCPending(htlcID, "claim", txid)
+	fmt.Println()
+	fmt.Println("Claim submitted. Your tyBTC will arrive once the L1 tx is mined.")
+}
+
+// --- Swap buy state persistence ---
+
+type swapBuyState struct {
+	Preimage [32]byte `json:"preimage"`
+	Invoice  string   `json:"invoice"`
+}
+
+func swapBuyStatePath(htlcID uint64) string {
+	return filepath.Join(pendingDir, "swaps", fmt.Sprintf("buy_%d.json", htlcID))
+}
+
+func saveSwapBuyState(htlcID uint64, preimage [32]byte, invoice string) {
+	dir := filepath.Join(pendingDir, "swaps")
+	os.MkdirAll(dir, 0700)
+	state := swapBuyState{Preimage: preimage, Invoice: invoice}
+	data, _ := json.Marshal(state)
+	if err := os.WriteFile(swapBuyStatePath(htlcID), data, 0600); err != nil {
+		// This is critical — if we can't save the preimage, the user could lose funds.
+		fatal("CRITICAL: failed to save swap state: %v\n  Preimage: %s\n  Save this preimage manually!", err, hex.EncodeToString(preimage[:]))
+	}
+}
+
+func loadSwapBuyState(htlcID uint64) *swapBuyState {
+	data, err := os.ReadFile(swapBuyStatePath(htlcID))
+	if err != nil {
+		return nil
+	}
+	var state swapBuyState
+	if json.Unmarshal(data, &state) != nil {
+		return nil
+	}
+	return &state
+}
+
+// readStorageUint64Safe is like readStorageUint64 but returns 0 on any error.
+func readStorageUint64Safe(addrHex string, slot uint64) uint64 {
+	var key types.Hash256
+	binary.BigEndian.PutUint64(key[24:], slot)
+	result := rpcCallSafe("tyl_getStorage", []string{addrHex, key.Hex()})
+	if result == nil {
+		return 0
+	}
+	var sr struct {
+		Value string `json:"value"`
+	}
+	json.Unmarshal(result, &sr)
+	valBytes, _ := hex.DecodeString(stripHex(sr.Value))
+	if len(valBytes) < 32 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(valBytes[24:])
+}
+
+// swap sell --htlc <id> --invoice <bolt11>
+// Tells the swap daemon to pay the user's invoice and claim the HTLC.
+func cmdSwapSell(args []string) {
+	_, flags := parseFlags(args)
+
+	htlcStr, ok := flags["htlc"]
+	if !ok || htlcStr == "" {
+		fatal("usage: tylcli swap sell --htlc <id> --invoice <bolt11>")
+	}
+	htlcID := mustParseUint(htlcStr, "htlc")
+
+	invoice, ok := flags["invoice"]
+	if !ok || invoice == "" {
+		fatal("usage: tylcli swap sell --htlc <id> --invoice <bolt11>")
+	}
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"htlcID":  htlcID,
+		"invoice": invoice,
+	})
+
+	resp := swapdPost("/swap/sell", reqBody)
+	var sellResp struct {
+		SwapID string `json:"swapID"`
+	}
+	if err := json.Unmarshal(resp, &sellResp); err != nil {
+		fatal("parse swap response: %v", err)
+	}
+
+	fmt.Printf("swap %s created\n", sellResp.SwapID)
+	fmt.Printf("  HTLC:    %d\n", htlcID)
+	fmt.Printf("  invoice: %s\n", invoice)
+	fmt.Println()
+	fmt.Println("The daemon will pay your invoice and claim the HTLC.")
+	fmt.Printf("Track with: tylcli swap status %s\n", sellResp.SwapID)
+}
+
+func cmdSwapList() {
+	resp := swapdGet("/swap/list")
+	var swaps []struct {
+		ID          string `json:"id"`
+		Direction   int    `json:"direction"`
+		State       int    `json:"state"`
+		AmountTyBTC uint64 `json:"amountTyBTC"`
+		HTLCID      uint64 `json:"htlcID"`
+		Error       string `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(resp, &swaps); err != nil {
+		fatal("parse swap list: %v", err)
+	}
+
+	if len(swaps) == 0 {
+		fmt.Println("no swaps")
+		return
+	}
+
+	for _, s := range swaps {
+		dir := "buy "
+		if s.Direction == 2 {
+			dir = "sell"
+		}
+		state := swapStateName(s.State)
+		errSuffix := ""
+		if s.Error != "" {
+			errSuffix = "  err: " + s.Error
+		}
+		fmt.Printf("%-8s %s  %-18s  htlc:%-4d  %d tyBTC%s\n", s.ID, dir, state, s.HTLCID, s.AmountTyBTC, errSuffix)
+	}
+}
+
+func cmdSwapStatus(args []string) {
+	if len(args) < 1 {
+		fatal("usage: tylcli swap status <swap_id>")
+	}
+	swapID := args[0]
+	resp := swapdGet("/swap/status?id=" + swapID)
+	var s struct {
+		ID          string `json:"id"`
+		Direction   int    `json:"direction"`
+		State       int    `json:"state"`
+		AmountTyBTC uint64 `json:"amountTyBTC"`
+		AmountSats  int64  `json:"amountSats"`
+		HTLCID      uint64 `json:"htlcID"`
+		Timelock    uint64 `json:"timelock"`
+		Invoice     string `json:"invoice,omitempty"`
+		Error       string `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(resp, &s); err != nil {
+		fatal("parse swap status: %v", err)
+	}
+
+	dir := "buy"
+	if s.Direction == 2 {
+		dir = "sell"
+	}
+	fmt.Printf("swap %s (%s):\n", s.ID, dir)
+	fmt.Printf("  state:    %s\n", swapStateName(s.State))
+	fmt.Printf("  amount:   %d tyBTC (%d sats)\n", s.AmountTyBTC, s.AmountSats)
+	fmt.Printf("  htlc:     %d\n", s.HTLCID)
+	fmt.Printf("  timelock: %d\n", s.Timelock)
+	if s.Invoice != "" {
+		fmt.Printf("  invoice:  %s\n", s.Invoice)
+	}
+	if s.Error != "" {
+		fmt.Printf("  error:    %s\n", s.Error)
+	}
+}
+
+func swapStateName(state int) string {
+	switch state {
+	case 0:
+		return "created"
+	case 1:
+		return "htlc_locked"
+	case 2:
+		return "invoice_created"
+	case 3:
+		return "payment_in_flight"
+	case 4:
+		return "claimed"
+	case 5:
+		return "settled"
+	case 6:
+		return "refunded"
+	case 7:
+		return "failed"
+	case 8:
+		return "refund_submitted"
+	default:
+		return fmt.Sprintf("unknown(%d)", state)
+	}
+}
+
+// swapdPost sends a POST request to the swap daemon.
+func swapdPost(path string, body []byte) json.RawMessage {
+	req, err := http.NewRequest("POST", swapdEndpoint+path, bytes.NewReader(body))
+	if err != nil {
+		fatal("swap daemon request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if swapdAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+swapdAPIKey)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fatal("swap daemon unreachable: %v\n  Is tylswapd running at %s?", err, swapdEndpoint)
+	}
+	defer resp.Body.Close()
+
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		// Try to extract error message.
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(data, &errResp) == nil && errResp.Error != "" {
+			fatal("swap daemon: %s", errResp.Error)
+		}
+		fatal("swap daemon: HTTP %d: %s", resp.StatusCode, data)
+	}
+	return json.RawMessage(data)
+}
+
+// swapdGet sends a GET request to the swap daemon.
+func swapdGet(path string) json.RawMessage {
+	req, err := http.NewRequest("GET", swapdEndpoint+path, nil)
+	if err != nil {
+		fatal("swap daemon request: %v", err)
+	}
+	if swapdAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+swapdAPIKey)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fatal("swap daemon unreachable: %v\n  Is tylswapd running at %s?", err, swapdEndpoint)
+	}
+	defer resp.Body.Close()
+
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(data, &errResp) == nil && errResp.Error != "" {
+			fatal("swap daemon: %s", errResp.Error)
+		}
+		fatal("swap daemon: HTTP %d: %s", resp.StatusCode, data)
+	}
+	return json.RawMessage(data)
+}
+
+// ============================================================
+// HTLC commands
+// ============================================================
+
+func cmdHTLC(args []string) {
+	if len(args) < 1 {
+		fatal("usage: tylcli htlc <lock|claim|refund|query> [args...]")
+	}
+	switch args[0] {
+	case "lock":
+		cmdHTLCLock(args[1:])
+	case "claim":
+		cmdHTLCClaim(args[1:])
+	case "refund":
+		cmdHTLCRefund(args[1:])
+	case "query":
+		cmdHTLCQuery(args[1:])
+	default:
+		fatal("unknown htlc subcommand: %s\n\nSubcommands: lock, claim, refund, query", args[0])
+	}
+}
+
+// htlc lock <to> <timelock> <hash> --value <amount> [--from <key>]
+func cmdHTLCLock(args []string) {
+	pos, flags := parseFlags(args)
+	if len(pos) < 3 {
+		fatal("usage: tylcli htlc lock <to> <timelock> <hash> --value <amount>")
+	}
+
+	recipientID := resolveArg(pos[0])
+	timelock := mustParseUint(pos[1], "timelock")
+	hashHex := stripHex(pos[2])
+	hashBytes, err := hex.DecodeString(hashHex)
+	if err != nil || len(hashBytes) != 32 {
+		fatal("hash must be 32-byte hex (64 chars)")
+	}
+
+	hw0 := beUint64(hashBytes[0:8])
+	hw1 := beUint64(hashBytes[8:16])
+	hw2 := beUint64(hashBytes[16:24])
+	hw3 := beUint64(hashBytes[24:32])
+
+	data := contracts.PackCallData(executor.HTLCFnLock, recipientID, timelock, hw0, hw1, hw2, hw3)
+
+	value, ok := flags["value"]
+	if !ok || value == "" {
+		fatal("--value is required for htlc lock")
+	}
+	amount := mustParseUint(value, "value")
+
+	key := resolveSigningKey(flags["from"])
+	addr := key.Public().Address()
+	nonce := fetchNonce(addr)
+
+	tx := &types.Transaction{
+		Version: 1, Nonce: nonce, From: addr,
+		To: executor.HTLCSystemAddress, Value: amount,
+		GasPrice: 1, GasLimit: 100_000, Data: data,
+	}
+	signTx(tx, key)
+
+	envelope := encoding.EncodeEnvelope(encoding.EnvelopeTypeTx, encoding.EncodeTx(tx))
+	txid := tx.TxID().Hex()
+
+	fmt.Printf("htlc lock: %d tyBTC, timelock=%d\n", amount, timelock)
+	if flags["no-push"] == "" {
+		pushAndReport(envelope, 0, txid)
+	} else {
+		fmt.Printf("txid: %s\nenvelope: %s\n", txid, hex.EncodeToString(envelope))
+	}
+}
+
+// htlc claim <htlc_id> <preimage> [--from <key>]
+func cmdHTLCClaim(args []string) {
+	pos, flags := parseFlags(args)
+	if len(pos) < 2 {
+		fatal("usage: tylcli htlc claim <htlc_id> <preimage>")
+	}
+
+	htlcID := mustParseUint(pos[0], "htlc_id")
+
+	// Pre-check: reject if HTLC is not pending on-chain.
+	base := uint64(10000) + htlcID*14
+	sysAddr := executor.HTLCSystemAddress.Hex()
+	status := readStorageUint64(sysAddr, base+8)
+	if status != 0 {
+		statusStr := "unknown"
+		switch status {
+		case 1:
+			statusStr = "already claimed"
+		case 2:
+			statusStr = "already refunded"
+		}
+		fatal("HTLC %d is not pending (status: %s)", htlcID, statusStr)
+	}
+
+	// Pre-check: reject if a claim is already in-flight.
+	checkHTLCPending(htlcID, "claim")
+
+	preimageHex := stripHex(pos[1])
+	preimageBytes, err := hex.DecodeString(preimageHex)
+	if err != nil || len(preimageBytes) != 32 {
+		fatal("preimage must be 32-byte hex (64 chars)")
+	}
+
+	pw0 := beUint64(preimageBytes[0:8])
+	pw1 := beUint64(preimageBytes[8:16])
+	pw2 := beUint64(preimageBytes[16:24])
+	pw3 := beUint64(preimageBytes[24:32])
+
+	data := contracts.PackCallData(executor.HTLCFnClaim, htlcID, pw0, pw1, pw2, pw3)
+
+	key := resolveSigningKey(flags["from"])
+	addr := key.Public().Address()
+	nonce := fetchNonce(addr)
+
+	tx := &types.Transaction{
+		Version: 1, Nonce: nonce, From: addr,
+		To: executor.HTLCSystemAddress,
+		GasPrice: 0, GasLimit: 0, Data: data,
+	}
+	signTx(tx, key)
+
+	envelope := encoding.EncodeEnvelope(encoding.EnvelopeTypeTx, encoding.EncodeTx(tx))
+	txid := tx.TxID().Hex()
+
+	fmt.Printf("htlc claim: id=%d\n", htlcID)
+	if flags["no-push"] == "" {
+		pushAndReport(envelope, 0, txid)
+		markHTLCPending(htlcID, "claim", txid)
+	} else {
+		fmt.Printf("txid: %s\nenvelope: %s\n", txid, hex.EncodeToString(envelope))
+	}
+}
+
+// htlc refund <htlc_id> [--from <key>]
+func cmdHTLCRefund(args []string) {
+	pos, flags := parseFlags(args)
+	if len(pos) < 1 {
+		fatal("usage: tylcli htlc refund <htlc_id>")
+	}
+
+	htlcID := mustParseUint(pos[0], "htlc_id")
+
+	// Pre-check: reject if HTLC is not pending on-chain.
+	base := uint64(10000) + htlcID*14
+	sysAddr := executor.HTLCSystemAddress.Hex()
+	status := readStorageUint64(sysAddr, base+8)
+	if status != 0 {
+		statusStr := "unknown"
+		switch status {
+		case 1:
+			statusStr = "already claimed"
+		case 2:
+			statusStr = "already refunded"
+		}
+		fatal("HTLC %d is not pending (status: %s)", htlcID, statusStr)
+	}
+
+	// Pre-check: reject if a refund is already in-flight.
+	checkHTLCPending(htlcID, "refund")
+
+	data := contracts.PackCallData(executor.HTLCFnRefund, htlcID)
+
+	key := resolveSigningKey(flags["from"])
+	addr := key.Public().Address()
+	nonce := fetchNonce(addr)
+
+	tx := &types.Transaction{
+		Version: 1, Nonce: nonce, From: addr,
+		To: executor.HTLCSystemAddress,
+		GasPrice: 1, GasLimit: 100_000, Data: data,
+	}
+	signTx(tx, key)
+
+	envelope := encoding.EncodeEnvelope(encoding.EnvelopeTypeTx, encoding.EncodeTx(tx))
+	txid := tx.TxID().Hex()
+
+	fmt.Printf("htlc refund: id=%d\n", htlcID)
+	if flags["no-push"] == "" {
+		pushAndReport(envelope, 0, txid)
+		markHTLCPending(htlcID, "refund", txid)
+	} else {
+		fmt.Printf("txid: %s\nenvelope: %s\n", txid, hex.EncodeToString(envelope))
+	}
+}
+
+// htlc query <htlc_id>
+func cmdHTLCQuery(args []string) {
+	pos, _ := parseFlags(args)
+	if len(pos) < 1 {
+		fatal("usage: tylcli htlc query <htlc_id>")
+	}
+
+	htlcID := mustParseUint(pos[0], "htlc_id")
+	base := 10000 + htlcID*14
+	sysAddr := executor.HTLCSystemAddress.Hex()
+
+	senderID := readStorageUint64(sysAddr, base+0)
+	recipientID := readStorageUint64(sysAddr, base+1)
+	amount := readStorageUint64(sysAddr, base+2)
+	timelock := readStorageUint64(sysAddr, base+7)
+	status := readStorageUint64(sysAddr, base+8)
+
+	// Read hashlock.
+	hw0 := readStorageUint64(sysAddr, base+3)
+	hw1 := readStorageUint64(sysAddr, base+4)
+	hw2 := readStorageUint64(sysAddr, base+5)
+	hw3 := readStorageUint64(sysAddr, base+6)
+	var hashlock [32]byte
+	beWriteUint64(hashlock[0:8], hw0)
+	beWriteUint64(hashlock[8:16], hw1)
+	beWriteUint64(hashlock[16:24], hw2)
+	beWriteUint64(hashlock[24:32], hw3)
+
+	statusStr := "unknown"
+	switch status {
+	case 0:
+		statusStr = "pending"
+	case 1:
+		statusStr = "claimed"
+	case 2:
+		statusStr = "refunded"
+	}
+
+	fmt.Printf("HTLC %d:\n", htlcID)
+	fmt.Printf("  status:    %s (%d)\n", statusStr, status)
+	fmt.Printf("  sender:    %d\n", senderID)
+	fmt.Printf("  recipient: %d\n", recipientID)
+	fmt.Printf("  amount:    %d\n", amount)
+	fmt.Printf("  timelock:  %d\n", timelock)
+	fmt.Printf("  hashlock:  %s\n", hex.EncodeToString(hashlock[:]))
+
+	if status == 1 {
+		pw0 := readStorageUint64(sysAddr, base+9)
+		pw1 := readStorageUint64(sysAddr, base+10)
+		pw2 := readStorageUint64(sysAddr, base+11)
+		pw3 := readStorageUint64(sysAddr, base+12)
+		var preimage [32]byte
+		beWriteUint64(preimage[0:8], pw0)
+		beWriteUint64(preimage[8:16], pw1)
+		beWriteUint64(preimage[16:24], pw2)
+		beWriteUint64(preimage[24:32], pw3)
+		fmt.Printf("  preimage:  %s\n", hex.EncodeToString(preimage[:]))
+	}
+}
+
+func readStorageUint64(addrHex string, slot uint64) uint64 {
+	var key types.Hash256
+	binary.BigEndian.PutUint64(key[24:], slot)
+	result := rpcCall("tyl_getStorage", []string{addrHex, key.Hex()})
+	var sr struct {
+		Value string `json:"value"`
+	}
+	json.Unmarshal(result, &sr)
+	valBytes, _ := hex.DecodeString(stripHex(sr.Value))
+	if len(valBytes) < 32 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(valBytes[24:])
+}
+
+func beUint64(b []byte) uint64 {
+	return binary.BigEndian.Uint64(b)
+}
+
+func beWriteUint64(b []byte, v uint64) {
+	binary.BigEndian.PutUint64(b, v)
 }
 
 // ============================================================
@@ -1291,6 +2026,38 @@ func knownFnNames() string {
 		names = append(names, n)
 	}
 	return strings.Join(names, ", ")
+}
+
+// --- Pending HTLC operation tracking ---
+
+// checkHTLCPending checks if an HTLC operation is already pending.
+// If a pending op exists and the tx is still unconfirmed, it blocks.
+// If the tx has since been confirmed, it clears the pending marker.
+func checkHTLCPending(htlcID uint64, op string) {
+	path := filepath.Join(pendingDir, fmt.Sprintf("htlc_%d_%s", htlcID, op))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return // no pending op
+	}
+	txid := strings.TrimSpace(string(data))
+	if txid == "" {
+		os.Remove(path)
+		return
+	}
+	// Check if the tx has been confirmed.
+	receipt := lookupReceipt(txid)
+	if receipt != nil {
+		os.Remove(path) // confirmed, clear pending
+		return
+	}
+	fatal("HTLC %d %s already pending (txid: %s)\nuse 'tylcli status %s' to check", htlcID, op, txid, txid)
+}
+
+// markHTLCPending records a pending HTLC operation.
+func markHTLCPending(htlcID uint64, op, txid string) {
+	os.MkdirAll(pendingDir, 0700)
+	path := filepath.Join(pendingDir, fmt.Sprintf("htlc_%d_%s", htlcID, op))
+	os.WriteFile(path, []byte(txid+"\n"), 0644)
 }
 
 // --- Pending txid tracking ---

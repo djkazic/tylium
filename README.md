@@ -80,6 +80,15 @@ tylcli account <name|addr>               Nonce, balance, contract status
 tylcli finalized                         Show finalized vs optimistic height
 tylcli receipts [height]                 Show receipts for a block
 tylcli storage <addr> <slot>             Read contract storage
+tylcli swap buy --amount <amt>           Buy tyBTC with Lightning (fully automatic)
+tylcli swap buy --resume <htlc_id>       Resume an interrupted buy
+tylcli swap sell --htlc <id> --invoice   Sell tyBTC for Lightning
+tylcli swap list                         List active swaps
+tylcli swap status <id>                  Check swap status
+tylcli htlc lock <to> <tl> <hash> -v    Lock tyBTC in an HTLC
+tylcli htlc claim <id> <preimage>        Claim an HTLC (gasless)
+tylcli htlc refund <id>                  Refund an expired HTLC
+tylcli htlc query <id>                   Query HTLC status
 tylcli tx [--to ...] [--data ...]        Raw transaction builder (power user)
 ```
 
@@ -99,14 +108,16 @@ AMM: `addLiquidity <amountA> <amountB>`, `removeLiquidity <lpAmount>`, `swapAFor
 --btcuser USER       Bitcoin RPC user (default: tylium)
 --btcpass PASS       Bitcoin RPC pass (default: tylium)
 --wallet NAME        Bitcoin wallet name
+--swapd URL          Swap daemon API (default: http://127.0.0.1:19333)
+--swapd-key KEY      API key for swap daemon
 ```
 
-Environment variables: `TYL_RPC`, `BTC_RPC`, `BTC_USER`, `BTC_PASS`, `BTC_WALLET`.
+Environment variables: `TYL_RPC`, `BTC_RPC`, `BTC_USER`, `BTC_PASS`, `BTC_WALLET`, `TYL_SWAPD`, `TYL_SWAPD_KEY`.
 
 ## Building
 
 ```bash
-make build    # builds all binaries: tyld, tylminer, tylcli, tylpush, tylbuild, tylsim
+make build    # builds all binaries: tyld, tylminer, tylcli, tylpush, tylbuild, tylsim, tylswapd
 make test     # runs all tests
 make clean    # removes built binaries
 ```
@@ -158,6 +169,47 @@ Invalid operations revert state — the sender pays gas but no reserves change.
 ```
 fee = SLOAD(slot 5)
 amountOut = reserveOut * (amountIn * fee) / (reserveIn * 1000 + amountIn * fee)
+```
+
+## Lightning Atomic Swaps
+
+Tylium supports trustless atomic swaps between Lightning BTC and tyBTC via hash time-locked contracts (HTLCs). This is the primary mechanism for entering and exiting the network.
+
+### Entering: Buy tyBTC with Lightning
+
+```bash
+tylcli swap buy --amount 50000    # generates preimage, creates HTLC, prints invoice
+```
+
+The CLI handles everything: generates a preimage, calls the swap daemon to lock tyBTC in an HTLC, prints a Lightning invoice to pay, then polls and auto-claims the HTLC once the invoice is paid. HTLC claims are gasless — new accounts with zero balance can claim. If interrupted, resume with `--resume <htlc_id>`.
+
+### Exiting: Sell tyBTC for Lightning
+
+```bash
+tylcli htlc lock <daemon_addr> <timelock> <hash> --value 50000
+tylcli swap sell --htlc <id> --invoice <bolt11>
+```
+
+Lock tyBTC in an HTLC addressed to the swap daemon, then tell the daemon to pay your Lightning invoice. The daemon pays the invoice (revealing the preimage) and claims the HTLC. To precisely empty an account, set `value = balance - 200` with `gasPrice=1, gasLimit=200` — the HTLC lock costs exactly 200 gas.
+
+### Swap Daemon
+
+```bash
+tylswapd --key <PRIVATE_KEY_HEX> --datadir ~/.tylswapd \
+         --btcrpc http://127.0.0.1:18332 --btcuser <user> --btcpass <pass> \
+         --lndrest https://127.0.0.1:8080 --lndcert ~/.lnd/tls.cert \
+         --lndmacaroon ~/.lnd/data/chain/bitcoin/testnet/admin.macaroon
+```
+
+The daemon manages liquidity, creates hold invoices, monitors HTLCs, and handles refunds. Optional `--apikey` flag enables Bearer token authentication. Swap state is persisted to disk and survives restarts.
+
+### Low-Level HTLC Commands
+
+```bash
+tylcli htlc lock <to> <timelock> <hash> --value <amount>
+tylcli htlc claim <id> <preimage>
+tylcli htlc refund <id>
+tylcli htlc query <id>
 ```
 
 ## Call Data ABI
@@ -217,6 +269,7 @@ cmd/
   tylcli/        CLI client (keys, deploy, call, query)
   tylpush/       Low-level envelope embedding tool
   tylbuild/      Contract bytecode generator
+  tylswapd/      Lightning swap daemon
   tylsim/        Long-running simulation
 
 contracts/       Token + AMM contract builders & tests
@@ -230,6 +283,7 @@ internal/
   scanner/       L1 witness data extraction
   state/         StateDB with Merkle commitment
   store/         LevelDB persistence
+  swap/          Atomic swap daemon (HTLC lifecycle, LND integration)
   vm/            Stack-based virtual machine
 
 pkg/

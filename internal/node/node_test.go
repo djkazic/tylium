@@ -1,6 +1,7 @@
 package node
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"testing"
 
@@ -38,7 +39,19 @@ func newTestNode(t *testing.T, genesis uint64) *Node {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	stateDB := state.NewStateDB(merkle.NewMemStore())
+	// Use a shared MemStore per address so storage data survives trie recreation
+	// (e.g., after ClearStorageTries in tryFinalize).
+	storageStores := make(map[types.Address]merkle.NodeStore)
+	factory := func(addr types.Address) merkle.NodeStore {
+		if s, ok := storageStores[addr]; ok {
+			return s
+		}
+		s := merkle.NewMemStore()
+		storageStores[addr] = s
+		return s
+	}
+
+	stateDB := state.NewStateDBWithFactory(merkle.NewMemStore(), factory)
 	exec := executor.New(stateDB)
 
 	return &Node{
@@ -460,5 +473,134 @@ func TestRollbackStateRootMatches(t *testing.T) {
 	}
 	if stored.StateRoot != n.stateRoot {
 		t.Fatal("stored block 2 root should match node state root")
+	}
+}
+
+func storageKey(slot uint64) types.Hash256 {
+	var k types.Hash256
+	binary.BigEndian.PutUint64(k[24:], slot)
+	return k
+}
+
+func storageVal(v uint64) types.Hash256 {
+	var h types.Hash256
+	binary.BigEndian.PutUint64(h[24:], v)
+	return h
+}
+
+func readStorageVal(h types.Hash256) uint64 {
+	return binary.BigEndian.Uint64(h[24:])
+}
+
+// TestTryFinalizeSnapshotReflectsFinalizedState verifies that the finalized
+// snapshot captures state at the finalized height, not the tip.
+// This is the regression test for the bug where SnapshotFinalized() was called
+// after block execution, capturing the tip state instead of the finalized state.
+func TestTryFinalizeSnapshotReflectsFinalizedState(t *testing.T) {
+	n := newTestNode(t, 0)
+	contract := types.BytesToAddress([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42})
+
+	// Block 1: write storage slot=0 value=100.
+	n.stateDB.SetStorage(contract, storageKey(0), storageVal(100))
+	processAndPersist(t, n, 1, nil)
+
+	// Block 2: write storage slot=0 value=200.
+	n.stateDB.SetStorage(contract, storageKey(0), storageVal(200))
+	processAndPersist(t, n, 2, nil)
+
+	// Block 3: write storage slot=0 value=300, slot=1 value=999.
+	n.stateDB.SetStorage(contract, storageKey(0), storageVal(300))
+	n.stateDB.SetStorage(contract, storageKey(1), storageVal(999))
+	processAndPersist(t, n, 3, nil)
+
+	// Checkpoint attests to block 2's state root (block 3 is the tip but unfinalized).
+	block2Root := func() types.Hash256 {
+		for root, h := range n.rootToHeight {
+			if h == 2 {
+				return root
+			}
+		}
+		t.Fatal("block 2 root not found")
+		return types.ZeroHash
+	}()
+	cp := makeCheckpoint(t, block2Root, types.ZeroHash)
+	n.processCheckpoints([]*types.Checkpoint{cp})
+	n.tryFinalize()
+
+	if n.finalizedHeight != 2 {
+		t.Fatalf("expected finalized height 2, got %d", n.finalizedHeight)
+	}
+
+	// The finalized snapshot should reflect block 2's state (value=200),
+	// NOT block 3's state (value=300).
+	fv, ok := n.stateDB.GetFinalizedStorage(contract, storageKey(0))
+	if !ok {
+		t.Fatal("expected finalized snapshot to exist")
+	}
+	if readStorageVal(fv) != 200 {
+		t.Fatalf("finalized storage slot 0: expected 200 (block 2), got %d", readStorageVal(fv))
+	}
+
+	// Slot 1 should NOT exist in finalized state (only written in block 3).
+	fv1, ok := n.stateDB.GetFinalizedStorage(contract, storageKey(1))
+	if !ok {
+		t.Fatal("expected finalized snapshot to exist")
+	}
+	if !fv1.IsZero() {
+		t.Fatalf("finalized storage slot 1: expected zero (not in block 2), got %d", readStorageVal(fv1))
+	}
+
+	// Current (tip) state should still show block 3's values.
+	cv := n.stateDB.GetStorage(contract, storageKey(0))
+	if readStorageVal(cv) != 300 {
+		t.Fatalf("current storage slot 0: expected 300 (block 3), got %d", readStorageVal(cv))
+	}
+	cv1 := n.stateDB.GetStorage(contract, storageKey(1))
+	if readStorageVal(cv1) != 999 {
+		t.Fatalf("current storage slot 1: expected 999, got %d", readStorageVal(cv1))
+	}
+}
+
+// TestTryFinalizeAdvancesCorrectly verifies the basic tryFinalize flow:
+// checkpoint with known root advances finalized height, unknown root does not.
+func TestTryFinalizeAdvancesCorrectly(t *testing.T) {
+	n := newTestNode(t, 0)
+
+	blocks := make([]*types.Block, 5)
+	for i := 0; i < 5; i++ {
+		blocks[i] = processAndPersist(t, n, uint64(i+1), nil)
+	}
+
+	// No checkpoint → tryFinalize is a no-op.
+	n.tryFinalize()
+	if n.finalizedHeight != 0 {
+		t.Fatal("should not finalize without checkpoint")
+	}
+
+	// Checkpoint for block 3.
+	cp := makeCheckpoint(t, blocks[2].StateRoot, types.ZeroHash)
+	n.processCheckpoints([]*types.Checkpoint{cp})
+	n.tryFinalize()
+	if n.finalizedHeight != 3 {
+		t.Fatalf("expected finalized 3, got %d", n.finalizedHeight)
+	}
+
+	// Same checkpoint again → no advancement (h <= finalizedHeight).
+	n.tryFinalize()
+	if n.finalizedHeight != 3 {
+		t.Fatalf("expected finalized still 3, got %d", n.finalizedHeight)
+	}
+
+	// Checkpoint for block 5 → advances.
+	cp2 := makeCheckpoint(t, blocks[4].StateRoot, cp.AttestationHash)
+	n.processCheckpoints([]*types.Checkpoint{cp2})
+	n.tryFinalize()
+	if n.finalizedHeight != 5 {
+		t.Fatalf("expected finalized 5, got %d", n.finalizedHeight)
+	}
+
+	// Verify finalized root matches.
+	if n.finalizedRoot != blocks[4].StateRoot {
+		t.Fatal("finalized root should match block 5's state root")
 	}
 }

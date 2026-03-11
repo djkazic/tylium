@@ -1,6 +1,6 @@
 .PHONY: build clean test
 
-BINARIES = tyld tylminer tylcli tylpush tylbuild tylsim
+BINARIES = tyld tylminer tylcli tylpush tylbuild tylsim tylswapd
 
 build:
 	@for bin in $(BINARIES); do \

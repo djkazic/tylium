@@ -26,7 +26,7 @@ const (
 //
 //	Slot 0: next HTLC ID counter
 //
-// Per HTLC (base = 10000 + id * 10):
+// Per HTLC (base = 10000 + id * 14):
 //
 //	+0: sender caller_id
 //	+1: recipient caller_id
@@ -37,10 +37,14 @@ const (
 //	+6: hashlock word 3 (bytes 24-31)
 //	+7: timelock block height
 //	+8: status (0=pending, 1=claimed, 2=refunded)
+//	+9: preimage word 0 (set on claim)
+//	+10: preimage word 1
+//	+11: preimage word 2
+//	+12: preimage word 3
 const (
 	htlcSlotCounter = 0
 	htlcSlotBase    = 10000
-	htlcSlotStride  = 10
+	htlcSlotStride  = 14
 
 	htlcStatusPending  = 0
 	htlcStatusClaimed  = 1
@@ -124,6 +128,9 @@ func (h *htlcHandler) lock(tx *types.Transaction, senderID uint64) (bool, string
 // The caller must be the designated recipient.
 func (h *htlcHandler) claim(tx *types.Transaction, callerID uint64) (bool, string) {
 	htlcID := h.readSlot(101)
+	if htlcID >= h.readSlot(htlcSlotCounter) {
+		return false, fmt.Sprintf("HTLC %d: does not exist", htlcID)
+	}
 	pw0 := h.readSlot(102)
 	pw1 := h.readSlot(104)
 	pw2 := h.readSlot(105)
@@ -180,8 +187,12 @@ func (h *htlcHandler) claim(tx *types.Transaction, callerID uint64) (bool, strin
 	recipientAcct.Balance += amount
 	h.stateDB.SetAccount(tx.From, recipientAcct)
 
-	// Mark as claimed.
+	// Mark as claimed and persist the revealed preimage.
 	h.writeSlot(base+8, htlcStatusClaimed)
+	h.writeSlot(base+9, pw0)
+	h.writeSlot(base+10, pw1)
+	h.writeSlot(base+11, pw2)
+	h.writeSlot(base+12, pw3)
 
 	return true, ""
 }
@@ -190,6 +201,9 @@ func (h *htlcHandler) claim(tx *types.Transaction, callerID uint64) (bool, strin
 // Call data: selector=3, htlc_id(101)
 func (h *htlcHandler) refund(tx *types.Transaction, callerID uint64) (bool, string) {
 	htlcID := h.readSlot(101)
+	if htlcID >= h.readSlot(htlcSlotCounter) {
+		return false, fmt.Sprintf("HTLC %d: does not exist", htlcID)
+	}
 	base := htlcSlotBase + htlcID*htlcSlotStride
 
 	// Verify HTLC exists and is pending.
@@ -231,16 +245,25 @@ func (h *htlcHandler) refund(tx *types.Transaction, callerID uint64) (bool, stri
 
 // query writes HTLC info to return slots.
 // Call data: selector=4, htlc_id(101)
-// Returns: 200=sender_id, 201=recipient_id, 202=amount, 203=timelock, 204=status
+// Returns: 200=sender_id, 201=recipient_id, 202=amount, 203=timelock, 204=status,
+//
+//	205-208=preimage words (only meaningful when status=claimed)
 func (h *htlcHandler) query() (bool, string) {
 	htlcID := h.readSlot(101)
+	if htlcID >= h.readSlot(htlcSlotCounter) {
+		return false, fmt.Sprintf("HTLC %d: does not exist", htlcID)
+	}
 	base := htlcSlotBase + htlcID*htlcSlotStride
 
-	h.writeSlot(200, h.readSlot(base+0)) // sender_id
-	h.writeSlot(201, h.readSlot(base+1)) // recipient_id
-	h.writeSlot(202, h.readSlot(base+2)) // amount
-	h.writeSlot(203, h.readSlot(base+7)) // timelock
-	h.writeSlot(204, h.readSlot(base+8)) // status
+	h.writeSlot(200, h.readSlot(base+0))  // sender_id
+	h.writeSlot(201, h.readSlot(base+1))  // recipient_id
+	h.writeSlot(202, h.readSlot(base+2))  // amount
+	h.writeSlot(203, h.readSlot(base+7))  // timelock
+	h.writeSlot(204, h.readSlot(base+8))  // status
+	h.writeSlot(205, h.readSlot(base+9))  // preimage w0
+	h.writeSlot(206, h.readSlot(base+10)) // preimage w1
+	h.writeSlot(207, h.readSlot(base+11)) // preimage w2
+	h.writeSlot(208, h.readSlot(base+12)) // preimage w3
 
 	return true, ""
 }

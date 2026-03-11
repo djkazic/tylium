@@ -228,12 +228,26 @@ func (s *StateDB) GetFinalizedBalance(addr types.Address) (uint64, bool) {
 // GetFinalizedStorage returns a storage value at the last finalized snapshot.
 // Returns (value, true) if a finalized snapshot exists, (zero, false) otherwise.
 func (s *StateDB) GetFinalizedStorage(addr types.Address, key types.Hash256) (types.Hash256, bool) {
-	if s.finalizedStorageSnap == nil {
+	if s.finalizedSnap == nil {
 		return types.ZeroHash, false
 	}
 	snap, ok := s.finalizedStorageSnap[addr]
 	if !ok {
-		return types.ZeroHash, true // contract didn't exist at finalized point
+		// Lazily load storage trie from finalized account's storage root.
+		acctKey := types.Sha256(addr[:])
+		acctData := s.finalizedSnap.Get(acctKey)
+		if acctData == nil {
+			return types.ZeroHash, true // account doesn't exist at finalized point
+		}
+		acct, err := encoding.DecodeAccount(acctData)
+		if err != nil || acct.StorageRoot.IsZero() {
+			return types.ZeroHash, true // no storage
+		}
+		trie := merkle.NewTree(s.storeFactory(addr))
+		trie.LoadRoot(acct.StorageRoot)
+		storageSnap := trie.TakeSnapshot()
+		s.finalizedStorageSnap[addr] = storageSnap
+		snap = storageSnap
 	}
 	data := snap.Get(key)
 	if data == nil {

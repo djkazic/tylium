@@ -149,6 +149,12 @@ func (e *Executor) executeTx(tx *types.Transaction) *Receipt {
 		return &Receipt{TxID: txid, Success: false, GasUsed: 0, Err: "invalid signature"}
 	}
 
+	// HTLC claims are gasless — the recipient may have zero balance.
+	// Nonce is still checked and incremented to prevent replays.
+	if isHTLCClaim(tx) {
+		return e.executeHTLCClaim(tx)
+	}
+
 	// Size limits.
 	if tx.To.IsZero() && len(tx.Data) > MaxCodeSize {
 		return &Receipt{TxID: txid, Success: false, GasUsed: 0, Err: "contract code exceeds max size"}
@@ -205,7 +211,7 @@ func (e *Executor) executeTx(tx *types.Transaction) *Receipt {
 
 	// Execute contract code if applicable.
 	if tx.To == HTLCSystemAddress && len(tx.Data) > 0 {
-		// HTLC precompile — native handler, no VM.
+		// HTLC precompile (lock, refund, query) — native handler, no VM.
 		e.writeCallData(tx.To, tx.From, tx.Data)
 		handler := &htlcHandler{stateDB: e.stateDB, currentHeight: e.currentHeight}
 		ok, errMsg := handler.processHTLC(tx)
@@ -275,6 +281,58 @@ func (e *Executor) executeTx(tx *types.Transaction) *Receipt {
 	e.stateDB.SetAccount(tx.From, sender)
 
 	return &Receipt{TxID: txid, Success: true, GasUsed: gasUsed}
+}
+
+// isHTLCClaim returns true if the transaction is an HTLC claim.
+// Checks: To == HTLCSystemAddress, data starts with function selector 2 (claim).
+func isHTLCClaim(tx *types.Transaction) bool {
+	if tx.To != HTLCSystemAddress || len(tx.Data) < 8 {
+		return false
+	}
+	selector := uint64(0)
+	for i := 0; i < 8; i++ {
+		selector = (selector << 8) | uint64(tx.Data[i])
+	}
+	return selector == HTLCFnClaim
+}
+
+// executeHTLCClaim handles HTLC claims with zero gas cost.
+// Only nonce and signature are checked — no balance requirement.
+func (e *Executor) executeHTLCClaim(tx *types.Transaction) *Receipt {
+	txid := tx.TxID()
+
+	// Gasless claims must not carry value.
+	if tx.Value != 0 {
+		return &Receipt{TxID: txid, Success: false, GasUsed: 0, Err: "gasless claim must have zero value"}
+	}
+
+	// Check nonce.
+	sender := e.stateDB.GetOrCreateAccount(tx.From)
+	if tx.Nonce != sender.Nonce {
+		return &Receipt{TxID: txid, Success: false, GasUsed: 0, Err: fmt.Sprintf("nonce mismatch: expected %d, got %d", sender.Nonce, tx.Nonce)}
+	}
+
+	// Take snapshot for revert on failure.
+	snap := e.stateDB.Snapshot()
+
+	// Increment nonce (no gas deduction).
+	sender.Nonce++
+	e.stateDB.SetAccount(tx.From, sender)
+
+	// Write call data and execute the claim.
+	e.writeCallData(tx.To, tx.From, tx.Data)
+	handler := &htlcHandler{stateDB: e.stateDB, currentHeight: e.currentHeight}
+	ok, errMsg := handler.processHTLC(tx)
+	if !ok {
+		e.stateDB.RevertToSnapshot(snap)
+		// Still increment nonce on failure to prevent replay.
+		sender = e.stateDB.GetOrCreateAccount(tx.From)
+		sender.Nonce++
+		e.stateDB.SetAccount(tx.From, sender)
+		return &Receipt{TxID: txid, Success: false, GasUsed: 0, Err: errMsg}
+	}
+
+	return &Receipt{TxID: txid, Success: true, GasUsed: 0}
 }
 
 // writeCallData unpacks tx.Data into contract storage slots for the VM.

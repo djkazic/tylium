@@ -92,6 +92,18 @@ func New(cfg *Config) (*Node, error) {
 			n.finalizedRoot = root
 		}
 
+		// Restore finalized snapshot if we have a persisted finalized root.
+		if !n.finalizedRoot.IsZero() && !n.stateRoot.IsZero() {
+			// Temporarily load finalized state to take snapshot.
+			stateDB.LoadTrieRoot(n.finalizedRoot)
+			stateDB.ClearStorageTries()
+			stateDB.SnapshotFinalized()
+			// Restore current state.
+			stateDB.LoadTrieRoot(n.stateRoot)
+			stateDB.ClearStorageTries()
+			log.Printf("restored finalized snapshot at height %d", n.finalizedHeight)
+		}
+
 		// Restore contract bytecodes from persistent storage into the in-memory StateDB.
 		if codes, err := st.ListCodes(); err == nil {
 			for hash, code := range codes {
@@ -492,10 +504,14 @@ func (n *Node) tryFinalize() {
 		n.persistFinalized()
 		log.Printf("finalized height %d, state root: %s", h, n.lastCheckpoint.StateRoot.Hex())
 	}
-	// Always take/refresh the snapshot — needed on re-sync where
-	// finalizedHeight was restored from disk but the in-memory
-	// snapshot doesn't exist yet.
+	// Snapshot the finalized state (not the current tip).
+	// Temporarily load the finalized root, snapshot, then restore current.
+	currentRoot := n.stateDB.Root()
+	n.stateDB.LoadTrieRoot(n.finalizedRoot)
+	n.stateDB.ClearStorageTries()
 	n.stateDB.SnapshotFinalized()
+	n.stateDB.LoadTrieRoot(currentRoot)
+	n.stateDB.ClearStorageTries()
 }
 
 // validateCheckpoint verifies a checkpoint's attestation hash and signature.

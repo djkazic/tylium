@@ -119,6 +119,16 @@ func main() {
 			continue
 		}
 
+		// Check if this root is already finalized — skip if so.
+		if finalizedRoot, err := getFinalizedRoot(tylRPC); err == nil && root == finalizedRoot {
+			lastRoot = root
+			if lastRootFile != "" {
+				os.WriteFile(lastRootFile, root[:], 0o644)
+			}
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
 		lastRoot = root
 		log.Printf("new state root: %s — mining...", root.Hex())
 
@@ -159,6 +169,43 @@ func main() {
 			os.WriteFile(lastRootFile, root[:], 0o644)
 		}
 	}
+}
+
+// getFinalizedRoot calls tyl_finalizedHeight to get the finalized state root.
+func getFinalizedRoot(endpoint string) (types.Hash256, error) {
+	body, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tyl_finalizedHeight",
+		"params":  []interface{}{},
+	})
+
+	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return types.ZeroHash, err
+	}
+	defer resp.Body.Close()
+
+	var rpcResp struct {
+		Result struct {
+			FinalizedRoot string `json:"finalizedRoot"`
+		} `json:"result"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+		return types.ZeroHash, err
+	}
+	if rpcResp.Error != nil {
+		return types.ZeroHash, fmt.Errorf("%s", rpcResp.Error.Message)
+	}
+
+	rootBytes, err := hex.DecodeString(rpcResp.Result.FinalizedRoot)
+	if err != nil {
+		return types.ZeroHash, err
+	}
+	return types.BytesToHash256(rootBytes), nil
 }
 
 // getStateRoot calls tyl_stateRoot on the tylium node.

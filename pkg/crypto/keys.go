@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"crypto/rand"
 	"fmt"
 
 	"github.com/djkazic/tylium/pkg/types"
@@ -63,6 +64,15 @@ func (pub *PublicKey) Address() types.Address {
 // Inner returns the underlying secp256k1 public key.
 func (pub *PublicKey) Inner() *secp256k1.PublicKey {
 	return pub.key
+}
+
+// GeneratePreimage generates a cryptographically random 32-byte preimage.
+func GeneratePreimage() ([32]byte, error) {
+	var preimage [32]byte
+	if _, err := rand.Read(preimage[:]); err != nil {
+		return preimage, fmt.Errorf("generate preimage: %w", err)
+	}
+	return preimage, nil
 }
 
 // DecompressPubKey restores a public key from 33-byte compressed form.
