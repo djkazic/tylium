@@ -238,8 +238,8 @@ func spendingTxFee(chunks [][]byte, controlBlock, tapScript []byte) uint64 {
 	vsize := (weight + 3) / 4
 
 	fee := uint64(vsize) * targetFeeRate
-	if fee < 546 {
-		fee = 546 // dust limit floor
+	if fee < 330 {
+		fee = 330 // P2TR dust limit floor
 	}
 	return fee
 }
