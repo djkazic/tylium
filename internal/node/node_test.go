@@ -350,6 +350,37 @@ func TestProcessCheckpointsValidation(t *testing.T) {
 	}
 }
 
+func TestStaleAttestationRejected(t *testing.T) {
+	n := newTestNode(t, 0)
+
+	// Process blocks 1-3.
+	blocks := make([]*types.Block, 3)
+	for i := 0; i < 3; i++ {
+		blocks[i] = processAndPersist(t, n, uint64(i+1), nil)
+	}
+
+	// Finalize block 2 via a checkpoint.
+	cp := makeCheckpoint(t, blocks[1].StateRoot, types.ZeroHash)
+	n.processCheckpoints([]*types.Checkpoint{cp})
+	n.tryFinalize()
+	if n.finalizedHeight != 2 {
+		t.Fatalf("expected finalized 2, got %d", n.finalizedHeight)
+	}
+
+	// Now submit another checkpoint for the SAME (already finalized) root.
+	staleCP := makeCheckpoint(t, blocks[1].StateRoot, cp.AttestationHash)
+	prevCheckpoint := n.lastCheckpoint
+	n.processCheckpoints([]*types.Checkpoint{staleCP})
+
+	// The stale checkpoint should be rejected — lastCheckpoint unchanged.
+	if n.lastCheckpoint != prevCheckpoint {
+		t.Fatal("stale attestation for already-finalized root should be rejected")
+	}
+
+	// Coinbase should not change to the stale miner.
+	// (both checkpoints use the same test key, but the principle holds)
+}
+
 func TestTryFinalizeRequiresRootInMap(t *testing.T) {
 	n := newTestNode(t, 0)
 	processAndPersist(t, n, 1, nil)
