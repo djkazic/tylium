@@ -750,6 +750,7 @@ func cmdSwapBuy(args []string) {
 		SwapID  string `json:"swapID"`
 		Invoice string `json:"invoice"`
 		HTLCID  uint64 `json:"htlcID"`
+		L1TxID  string `json:"l1TxID"`
 	}
 	if err := json.Unmarshal(resp, &buyResp); err != nil {
 		fatal("parse swap response: %v", err)
@@ -764,7 +765,7 @@ func cmdSwapBuy(args []string) {
 	fmt.Println()
 
 	// If interrupted, the user can resume with: tylcli swap buy --resume <htlc_id>
-	swapBuyWaitAndClaim(buyResp.HTLCID, preimage, key)
+	swapBuyWaitAndClaim(buyResp.HTLCID, preimage, key, buyResp.L1TxID)
 }
 
 // cmdSwapBuyResume picks up a buy swap that was interrupted.
@@ -790,15 +791,19 @@ func cmdSwapBuyResume(htlcID uint64, flags map[string]string) {
 		return
 	}
 
-	swapBuyWaitAndClaim(htlcID, state.Preimage, key)
+	swapBuyWaitAndClaim(htlcID, state.Preimage, key, "")
 }
 
-func swapBuyWaitAndClaim(htlcID uint64, preimage [32]byte, key *crypto.PrivateKey) {
+func swapBuyWaitAndClaim(htlcID uint64, preimage [32]byte, key *crypto.PrivateKey, l1TxID string) {
 	addr := key.Public().Address()
 	base := uint64(10000) + htlcID*14
 	sysAddr := executor.HTLCSystemAddress.Hex()
 
-	fmt.Println("Waiting for HTLC to appear on-chain...")
+	if l1TxID != "" {
+		fmt.Printf("Waiting for HTLC to appear on-chain (l1_txid: %s)\n", l1TxID)
+	} else {
+		fmt.Println("Waiting for HTLC to appear on-chain...")
+	}
 
 	for {
 		htlcAmount := readStorageUint64Safe(sysAddr, base+2)

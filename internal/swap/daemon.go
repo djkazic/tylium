@@ -142,6 +142,7 @@ type BuyResponse struct {
 	SwapID  string `json:"swapID"`
 	Invoice string `json:"invoice"` // Lightning invoice to pay
 	HTLCID  uint64 `json:"htlcID"`
+	L1TxID  string `json:"l1TxID"` // Bitcoin txid that embeds the HTLC lock
 }
 
 func (d *Daemon) handleBuy(w http.ResponseWriter, r *http.Request) {
@@ -240,7 +241,7 @@ func (d *Daemon) initBuySwap(hash [32]byte, recipient types.Address, amountTyBTC
 	}
 
 	// Lock tyBTC in Tylium HTLC (irreversible until timelock).
-	htlcID, err := d.lockHTLC(recipient, hash, amountTyBTC, timelock)
+	htlcID, l1TxID, err := d.lockHTLC(recipient, hash, amountTyBTC, timelock)
 	if err != nil {
 		d.lnd.CancelInvoice(hash) // best-effort cleanup
 		unreserve()
@@ -268,7 +269,7 @@ func (d *Daemon) initBuySwap(hash [32]byte, recipient types.Address, amountTyBTC
 	d.persistSwaps()
 
 	log.Printf("buy swap %s: locked %d tyBTC in HTLC %d, invoice created", swapID, amountTyBTC, htlcID)
-	return &BuyResponse{SwapID: swapID, Invoice: invoice, HTLCID: htlcID}, nil
+	return &BuyResponse{SwapID: swapID, Invoice: invoice, HTLCID: htlcID, L1TxID: l1TxID}, nil
 }
 
 // === Sell flow: user sends tyBTC, receives Lightning BTC ===
@@ -643,7 +644,7 @@ func (d *Daemon) checkSellSwap(s *Swap) {
 
 // === HTLC operations ===
 
-func (d *Daemon) lockHTLC(recipient types.Address, hash [32]byte, amount, timelock uint64) (uint64, error) {
+func (d *Daemon) lockHTLC(recipient types.Address, hash [32]byte, amount, timelock uint64) (uint64, string, error) {
 	recipientID := recipient.CallerID()
 	hw0 := binary.BigEndian.Uint64(hash[0:8])
 	hw1 := binary.BigEndian.Uint64(hash[8:16])
@@ -654,13 +655,13 @@ func (d *Daemon) lockHTLC(recipient types.Address, hash [32]byte, amount, timelo
 
 	nonce, _, err := d.tyl.GetAccount(d.addr)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 
 	// Get next HTLC ID before submitting.
 	nextID, err := d.tyl.GetNextHTLCID()
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 
 	tx := &types.Transaction{
@@ -676,7 +677,7 @@ func (d *Daemon) lockHTLC(recipient types.Address, hash [32]byte, amount, timelo
 
 	sig, err := crypto.Sign(tx.SigningHash(), d.privKey)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	tx.Signature = sig
 
@@ -685,11 +686,11 @@ func (d *Daemon) lockHTLC(recipient types.Address, hash [32]byte, amount, timelo
 
 	txid, err := bitcoin.EmbedEnvelope(d.btc, envelope)
 	if err != nil {
-		return 0, fmt.Errorf("embed HTLC lock: %w", err)
+		return 0, "", fmt.Errorf("embed HTLC lock: %w", err)
 	}
 	log.Printf("HTLC lock submitted: txid=%s, expected htlcID=%d", txid, nextID)
 
-	return nextID, nil
+	return nextID, txid, nil
 }
 
 func (d *Daemon) claimHTLC(htlcID uint64, preimage [32]byte) error {
